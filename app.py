@@ -1,3 +1,13 @@
+import sys
+
+if sys.platform != "win32":
+    try:
+        from gevent import monkey
+        monkey.patch_all()
+    except ImportError:
+        print("Gevent não instalado!")
+
+
 from flask import Flask, request, session, jsonify
 from flask_socketio import SocketIO, emit
 from google import genai
@@ -5,6 +15,7 @@ from google.genai import types
 from dotenv import load_dotenv
 from uuid import uuid4
 import os
+import time
 
 # Carrega as variáveis ocultas do arquivo .env (como a chave da API do Gemini)
 load_dotenv()
@@ -110,6 +121,7 @@ def handle_enviar_mensagem(data):
     """
     EVENTO: O Front-end mandou uma mensagem (ex: o usuário clicou em 'Enviar' no chat).
     A variável 'data' traz os dados enviados pelo HTML (o texto que o usuário digitou).
+    Inclui retry com backoff exponencial e fallback automático para outros modelos.
     """
     try:
         # Pega o texto de dentro do dicionário enviado pelo JS
@@ -121,29 +133,68 @@ def handle_enviar_mensagem(data):
             emit('erro', {"erro": "Mensagem não pode ser vazia."})
             return
 
-        # Puxa o histórico de conversa desse aluno específico
-        user_chat = get_user_chat()
-        if user_chat is None:
-            emit('erro', {"erro": "Sessão de chat não pôde ser estabelecida."})
-            return
-
-        # ==========================================
-        # COMUNICAÇÃO COM O GOOGLE GEMINI
-        # ==========================================
-        # Aqui o nosso servidor repassa a pergunta para a IA do Google...
-        resposta_gemini = user_chat.send_message(mensagem_usuario)
-
-        # ... e aqui extraímos apenas o texto da resposta que o Gemini devolveu.
-        # (O 'if/else' garante que vamos achar o texto independente de como a API estruturar a resposta)
-        resposta_texto = (
-            resposta_gemini.text
-            if hasattr(resposta_gemini, 'text')
-            else resposta_gemini.candidates[0].content.parts[0].text
-        )
+        # Lista de modelos para tentar (o principal + alternativas)
+        MODELOS_FALLBACK = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"]
+        MAX_RETRIES = 2  # tentativas por modelo
         
-        # O servidor usa o 'emit' para devolver a resposta final do bot lá para a tela do Front-end.
-        emit('nova_mensagem', {"remetente": "bot", "texto": resposta_texto, "session_id": session.get('session_id')})
-        app.logger.info(f"Resposta enviada para {session.get('session_id', request.sid)}: {resposta_texto}")
+        resposta_texto = None
+        ultimo_erro = None
+
+        for modelo in MODELOS_FALLBACK:
+            for tentativa in range(MAX_RETRIES):
+                try:
+                    # Pega ou cria o chat com o modelo atual
+                    user_chat = get_user_chat(force_model=modelo if modelo != MODELOS_FALLBACK[0] else None)
+                    if user_chat is None:
+                        emit('erro', {"erro": "Sessão de chat não pôde ser estabelecida."})
+                        return
+
+                    # Envia a mensagem para o Gemini
+                    resposta_gemini = user_chat.send_message(mensagem_usuario)
+
+                    # Extrai o texto da resposta
+                    resposta_texto = (
+                        resposta_gemini.text
+                        if hasattr(resposta_gemini, 'text')
+                        else resposta_gemini.candidates[0].content.parts[0].text
+                    )
+                    break  # Sucesso! Sai do loop de retries
+
+                except Exception as e:
+                    ultimo_erro = e
+                    erro_str = str(e).lower()
+                    
+                    # Se for erro 503 (sobrecarregado) ou 429 (limite de requisições), tenta de novo
+                    if '503' in erro_str or 'unavailable' in erro_str or '429' in erro_str or 'resource_exhausted' in erro_str:
+                        wait_time = (tentativa + 1) * 2  # 2s, 4s
+                        app.logger.warning(f"Modelo {modelo} sobrecarregado (tentativa {tentativa+1}/{MAX_RETRIES}). Aguardando {wait_time}s...")
+                        time.sleep(wait_time)
+                        
+                        # Limpa o chat atual para forçar recriação com o próximo modelo
+                        sid = session.get('session_id')
+                        if sid and sid in active_chats:
+                            active_chats[sid] = None
+                        continue
+                    else:
+                        # Se for outro tipo de erro, não tenta de novo
+                        raise e
+            
+            if resposta_texto:
+                break  # Sucesso! Sai do loop de modelos
+            else:
+                app.logger.warning(f"Modelo {modelo} falhou após {MAX_RETRIES} tentativas. Tentando próximo modelo...")
+                # Limpa o chat para forçar recriação com o próximo modelo
+                sid = session.get('session_id')
+                if sid and sid in active_chats:
+                    active_chats[sid] = None
+
+        if resposta_texto:
+            # Envia a resposta de volta para o front-end
+            emit('nova_mensagem', {"remetente": "bot", "texto": resposta_texto, "session_id": session.get('session_id')})
+            app.logger.info(f"Resposta enviada para {session.get('session_id', request.sid)}")
+        else:
+            # Todos os modelos falharam
+            emit('erro', {"erro": "Todos os modelos do Gemini estão temporariamente sobrecarregados. Por favor, tente novamente em alguns segundos."})
 
     except Exception as e:
         app.logger.error(f"Erro ao processar 'enviar_mensagem' para {session.get('session_id', request.sid)}: {e}", exc_info=True)
