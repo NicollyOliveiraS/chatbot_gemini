@@ -14,10 +14,7 @@ MODELO = "gemini-2.5-flash"
 
 # Aqui definimos o "Prompt de Sistema". É a personalidade e as regras que o bot deve seguir.
 instrucoes = """
-Você é um assistente virtual amigável e prestativo. Sua função é responder a perguntas dos usuários e fornecer informações úteis somente sobre diversos assuntos.
-Tente manter as respostas curtas, concisas, objetivas e claras. Se não souber a resposta, diga que não sabe e sugira que o usuário procure em outro lugar.
-Responda grosserias, ofensas e palavrões de forma amigável e cortês.
-"""
+Você é um assistente virtual que auxilia nos treinos de musculação. De sujestoes de treinos e dicas."""
 
 # Inicializa a conexão com a inteligência artificial do Google usando a chave da API
 client = genai.Client(api_key=os.getenv("GENAI_KEY"))
@@ -38,53 +35,41 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 # Ele guarda a conversa de cada aluno separadamente usando um ID único.
 active_chats = {}
 
-def get_user_chat():
+def get_user_chat(force_model=None):
     """
     Função principal de gerenciamento de usuários.
     Ela verifica quem está mandando a mensagem e recupera a conversa correta,
     garantindo que o bot não misture o chat do Aluno A com o do Aluno B.
+    Suporta fallback automático de modelo se o principal estiver congestionado.
     """
-    
-    # Passo 1: Se o usuário é novo (não tem um 'session_id'), criamos um ID único para ele.
-    # Usamos o 'uuid4' para gerar um código aleatório impossível de repetir.
     if 'session_id' not in session:
         session['session_id'] = str(uuid4())
         print(f"Nova sessão Flask criada: {session['session_id']}")
 
     session_id = session['session_id']
 
-    # Passo 2: Se o usuário já tem um ID, mas ainda não tem uma conversa aberta com o Gemini...
-    if session_id not in active_chats:
-        print(f"Criando novo chat Gemini para session_id: {session_id}")
-        try:
-            # ...nós criamos uma nova conversa e passamos as instruções (personalidade).
-            chat_session = client.chats.create(
-                model=MODELO,
-                config=types.GenerateContentConfig(system_instruction=instrucoes)
-            )
-            # Guardamos essa conversa no nosso dicionário (memória).
-            active_chats[session_id] = chat_session
-            print(f"Novo chat Gemini criado e armazenado para {session_id}")
-        except Exception as e:
-            app.logger.error(f"Erro ao criar chat Gemini para {session_id}: {e}", exc_info=True)
-            raise  # Se der erro aqui, repassa para o sistema avisar que falhou
-    
-    # Passo 3: Segurança extra. Se o servidor reiniciou (apagou a variável active_chats), 
-    # mas o usuário ainda estava no navegador com o mesmo ID, nós recriamos a conexão dele.
-    if session_id in active_chats and active_chats[session_id] is None:
-        print(f"Recriando chat Gemini para session_id existente (estava None): {session_id}")
-        try:
-            chat_session = client.chats.create(
-                model=MODELO,
-                config=types.GenerateContentConfig(system_instruction=instrucoes)
-            )
-            active_chats[session_id] = chat_session
-        except Exception as e:
-            app.logger.error(f"Erro ao recriar chat Gemini para {session_id}: {e}", exc_info=True)
-            raise
-
-    # Retorna o histórico de mensagens exato daquele usuário.
-    return active_chats[session_id]
+    # Se for forçado ou se o ID não existe/está nulo, criamos ou recriamos a conversa
+    if session_id not in active_chats or active_chats[session_id] is None or force_model:
+        models_to_try = [force_model] if force_model else ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"]
+        last_error = None
+        for model in models_to_try:
+            try:
+                print(f"Criando chat Gemini ({model}) para session_id: {session_id}")
+                chat_session = client.chats.create(
+                    model=model,
+                    config=types.GenerateContentConfig(system_instruction=instrucoes)
+                )
+                active_chats[session_id] = (chat_session, model)
+                print(f"Chat criado com sucesso usando {model}")
+                return chat_session
+            except Exception as e:
+                app.logger.warning(f"Erro ao criar chat com o modelo {model}: {e}")
+                last_error = e
+        if last_error:
+            raise last_error
+            
+    # Retorna o objeto de chat (que é a primeira posição da tupla (chat, modelo))
+    return active_chats[session_id][0]
 
 # Rota simples para verificar se o servidor está rodando.
 # Ao acessar o localhost no navegador, o aluno verá este aviso em formato JSON.
@@ -176,4 +161,4 @@ def handle_disconnect():
 
 # Inicia o servidor local. A porta padrão do Flask costuma ser a 5000.
 if __name__ == "__main__":
-    socketio.run(app)
+    socketio.run(app, port=5001, debug=True)
