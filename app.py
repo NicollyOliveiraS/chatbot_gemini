@@ -208,6 +208,9 @@ def handle_disconnect():
         print(f"Chat removido da memória para sid: {sid}")
 
 
-# Inicia o servidor local. A porta padrão do Flask costuma ser a 5000.
+# Inicia o servidor. Lê a porta do ambiente (necessário para o Render) ou usa a 5001 por padrão.
 if __name__ == "__main__":
-    socketio.run(app, port=5001, debug=True)
+    port = int(os.environ.get("PORT", 5001))
+    # No Render, precisamos escutar em 0.0.0.0. Localmente usa 127.0.0.1.
+    host = "0.0.0.0" if os.environ.get("PORT") else "127.0.0.1"
+    socketio.run(app, host=host, port=port, debug=True)
